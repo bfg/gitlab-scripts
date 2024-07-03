@@ -1,0 +1,460 @@
+#!/usr/bin/env bash
+
+######################################################################
+#                             GLOBALS                                #
+######################################################################
+
+SSH_REMOTE=${SSH_REMOTE:-""}
+SSH_PORT=${SSH_PORT:-"22"}
+SSH_OPTS=${SSH_OPTS:-""}
+SSH_REMOTE_DIR=${SSH_REMOTE_DIR:-""}
+
+DO_IT=${DO_IT:-"0"}
+DO_CLEANUP=${DO_CLEANUP:-"1"}
+INCLUDE_COMMON_FUNCTIONS=${INCLUDE_COMMON_FUNCTIONS:-"0"}
+SHOW_DEPLOY_SCRIPT=${SHOW_DEPLOY_SCRIPT:-"0"}
+
+AUTH_SSH_KEY_PRIVATE=${AUTH_SSH_KEY_PRIVATE:-""}
+
+######################################################################
+#                            FUNCTIONS                               #
+######################################################################
+
+set -o pipefail
+#set -e
+
+SSH_PRIVATE_KEY=""
+_LOG_MSG_PREFIX=${_LOG_MSG_PREFIX:-""}
+MYNAME=$(basename "$0")
+
+##BEGIN_COMMON_FUNCTIONS
+
+SCRIPT_DIR=$( cd -- "$( dirname -- "${BASH_SOURCE[0]}" )" &> /dev/null && pwd )
+
+DO_CLEANUP=${DO_CLEANUP:-"1"}
+_INFO=${_INFO:-"1"}
+_DEBUG=${_DEBUG:-"0"}
+_VERBOSE=${_VERBOSE:-"0"}
+_CLEANUP_ITEMS=()
+
+cleanup_perform() {
+  local item=""
+  if [ "$DO_CLEANUP" != "1" ]; then
+    [ ! -z "$_CLEANUP_ITEMS" ] && msg_warn "preserving execution evidence in:"
+    for item in "${_CLEANUP_ITEMS[@]}"; do
+      echo "  $item" 1>&2
+    done
+    return 0
+  fi
+
+  # do the real cleanup
+  for item in "${_CLEANUP_ITEMS[@]}"; do
+    msg_debug "removing cleanup item: $item"
+    rm -rf "$item" >/dev/null 2>&1
+  done
+
+  return 0
+}
+
+cleanup_add() {
+  local item=""
+  for item in "$@"; do
+    # item must be a present filesystem entry, file or dir
+    test -r "$item" || continue
+
+    # add to a cleanup list
+    _CLEANUP_ITEMS+=("$item")
+  done
+
+  return 0
+}
+
+my_exit_verbose() {
+  msg_info "exiting script with status: $*"
+  my_exit "$@"
+}
+
+my_exit() {
+  local exit_code=$1
+  cleanup_perform
+  exit $exit_code
+}
+
+die() {
+  echo "${_LOG_MSG_PREFIX}FATAL: $*" 1>&2
+  my_exit 1
+}
+
+log_datetime() {
+  date +"${_LOG_MSG_PREFIX}[%Y/%m/%d %H:%M:%S] "
+}
+
+msg_info() {
+  test "${_INFO}" = "1" || return 0
+  echo "$(log_datetime)INFO:  $*"
+}
+
+msg_warn() {
+  echo "$(log_datetime)WARN:  $*" 1>&2
+}
+
+msg_verbose() {
+  test "${_VERBOSE}" = "1" || return 0
+  echo "$(log_datetime)VERBOSE: $*" 1>&2
+}
+
+msg_debug() {
+  test "${_DEBUG}" = "1" || return 0
+  echo "$(log_datetime)DEBUG: $*" 1>&2
+}
+
+require_utils() {
+  local util=""
+  for util in "$@"; do
+    local bin=$(which "$util" 2>/dev/null)
+    test -z "$bin" -o ! -x "$bin" && die "utility is not installed: $util"
+  done
+
+  return 0
+}
+
+require_gnu_utils() {
+  local util=""
+  for util in "$@"; do
+    local bin=$(which "$util" 2>/dev/null)
+    test -z "$bin" -o ! -x "$bin" && die "GNU version of utility is not installed: $util"
+    "$bin" --version | grep -Eq "\(GNU |util-linux" || die "Not a GNU version of utility: $util"
+  done
+
+  return 0
+}
+
+##XXX_COMMON_FUNCTIONS
+##END_COMMON_FUNCTIONS
+
+script_init() {
+  # add script dir to path
+  PATH="${SCRIPT_DIR}:$PATH"
+
+  require_utils ssh ssh-keyscan sed
+  require_gnu_utils getopt date grep
+
+  return 0
+}
+
+validate_env_vars() {
+  test -z "${SSH_REMOTE}" && die "undefined remote address [should be in a form of user@host.example.com]"
+  test -z "${SSH_PORT}" && die "undefined remote listening port"
+
+  return 0
+}
+
+
+ssh_fetch_host_key() {
+  local remote=$(echo "${SSH_REMOTE}" | cut -d@ -f2)
+
+  # make ssh homedir
+  local ssh_dir="$HOME/.ssh"
+  mkdir -p "$ssh_dir" && chmod 0700 "$ssh_dir" || die "can't ensure ssh directory: $ssh_dir"
+
+  local known_hosts_file="${ssh_dir}/known_hosts"
+  if cat "$known_hosts_file" 2>/dev/null | grep -qP "^$remote"; then
+    msg_info "ssh host key for $remote already exists in $known_hosts_file"
+  else
+    msg_info "fetching ssh-key: $remote => $known_hosts_file"
+    ssh-keyscan -p "${SSH_PORT}" -T3 "${remote}" >> "${known_hosts_file}" 2>/dev/null
+  fi
+}
+
+ssh_maybe_install_keys() {
+  if [ ! -z "$AUTH_SSH_KEY_PRIVATE" ]; then
+    SSH_PRIVATE_KEY=$(mktemp 2>/dev/null)
+    test ! -f "$SSH_PRIVATE_KEY" && die "can't create ssh private key file"
+    cleanup_add "$SSH_PRIVATE_KEY"
+
+    echo "$AUTH_SSH_KEY_PRIVATE" | base64 -d > "${SSH_PRIVATE_KEY}"
+    msg_info "decoded ssh private key to: ${SSH_PRIVATE_KEY}"
+  fi
+
+  return 0
+}
+
+remote_script_write_common_functions() {
+  cat "$BASH_SOURCE" | \
+    grep -F -A1000 "##BEGIN_COMMON_FUNCTIONS"  | \
+    grep -F -B1000  "##END_COMMON_FUNCTIONS" | \
+    grep -B1000 "##XXX_COMMON_FUNCTIONS" | \
+    grep -Pv '^##'
+}
+
+remote_script_write() {
+  local script_file=$(mktemp 2>/dev/null)
+  cleanup_add "$script_file"
+
+  # shellcheck disable=SC2119
+  remote_script_write_out "$@" > "$script_file"
+
+  echo "$script_file"
+}
+
+remote_script_check_user_cmd_files() {
+  test -z "$*" && die "no user cmd files given, run $MYNAME --help for details."
+
+  local user_cmd_file=""
+  for user_cmd_file in "$@"; do
+    test -f "$user_cmd_file" -a -r "$user_cmd_file" || die "not a readable user cmd file: \`$user_cmd_file\`"
+  done
+
+  return 0
+}
+
+remote_script_write_out() {
+  # write shebang
+  echo '#!/usr/bin/env bash'
+  echo ""
+  echo "# NOTE: this is a file was auto-generated by $MYNAME;"
+  echo "#       it is intended to be invoked via ssh to perform tasks"
+  echo "#       on a remote machine."
+  echo ""
+
+  # write env vars and export them
+  echo "# BEGIN: source dotfiles"
+  echo '[[ -s "$HOME/.profile" ]] && . "$HOME/.profile" >/dev/null 2>&1'
+  echo '[[ -s "$HOME/.bashrc" ]] && . "$HOME/.bashrc" >/dev/null 2>&1'
+  echo '[[ -s "$HOME/.sdkman/bin/sdkman-init.sh" ]] && . "$HOME/.sdkman/bin/sdkman-init.sh"'
+  echo ""
+
+  echo "# BEGIN: add user home directory binary paths"
+  echo '[[ -d "$HOME/bin" ]] && PATH="$HOME/bin:$PATH"'
+  echo '[[ -d "$HOME/.local/bin" ]] && PATH="$HOME/.local/bin:$PATH"'
+  echo ""
+
+  # write common functions
+  if [ "${INCLUDE_COMMON_FUNCTIONS}" = "1" ]; then
+    echo "# BEGIN: common functions"
+    remote_script_write_common_functions
+
+    echo "# msg_xxx() functions should be transparent about remote execution"
+    echo "export _LOG_MSG_PREFIX='[**SSH_REMOTE**] '"
+    echo ""
+
+    echo "# END:  common functions"
+    echo ""
+  else
+    cat <<'EOF'
+die() {
+  echo "FATAL: $@"
+  my_exit 1
+}
+
+my_exit() {
+  exit "$1"
+}
+
+EOF
+  fi
+
+  # write env vars and export them
+  echo "# BEGIN: forwarded env vars from a host machine"
+  # export gitlab+github env vars by default
+  # SEE:
+  #   * https://docs.github.com/en/actions/learn-github-actions/variables#default-environment-variables
+  #   * https://docs.gitlab.com/ee/ci/variables/predefined_variables.html
+
+  # unset certain vars that break created script
+  unset CI_COMMIT_MESSAGE CI_COMMIT_DESCRIPTION CI_COMMIT_TAG_MESSAGE
+
+  # inject scripts env vars into script that will be executed remotely
+  declare -px | grep -P '^declare -x (?:CI|(?:GITLAB|GITHUB|CI|CHAT|RUNNER|DEPLOY)_)'
+  echo ""
+
+  # if remote dit is not empty... we want to change dir on remote
+  if [ -n "${SSH_REMOTE_DIR}" ]; then
+    echo "# BEGIN: change working directory"
+    echo "cd \"${SSH_REMOTE_DIR}\" || die \"can't enter directory: ${SSH_REMOTE_DIR}\""
+    echo ""
+  fi
+
+  # add user-defined cmd files
+  local user_cmd_file=""
+  for user_cmd_file in "$@"; do
+    test -f "$user_cmd_file" -a -r "$user_cmd_file" || die "not a readable user cmd file: $user_cmd_file"
+
+    echo "# BEGIN: user-defined cmd file: $user_cmd_file"
+    cat "$user_cmd_file"
+    echo "# END:   user-defined cmd file: $user_cmd_file"
+    echo ""
+  done
+
+  # exit with last command's exit status
+  echo '# exit with last command`s exit status and make sure that cleanup gets performed remotely'
+  echo 'my_exit $?'
+  echo ""
+
+  # this is it...
+  echo "# vim:shiftwidth=2 softtabstop=2 expandtab"
+  echo "# EOF"
+}
+
+ssh_run_deploy() {
+  # create a custom remote deploy cmd file
+  local cmd_file=$(remote_script_write "$@")
+  cleanup_add "$cmd_file"
+  test -z "$cmd_file" && my_exit 1
+
+  test "${_VERBOSE}" = "1" && {
+    msg_verbose "will execute the following script on remote: $cmd_file"
+    cat -n "$cmd_file" || true
+    echo ""
+  }
+
+  local opts="${SSH_OPTS}"
+  test -f "$SSH_PRIVATE_KEY" && opts="${opts} -i $SSH_PRIVATE_KEY"
+  test ! -z "$SSH_PORT" && opts="${opts} -p $SSH_PORT"
+
+  # remove spaces at the beginning of the string
+  opts="$(echo "$opts" | sed 's!^\ *!!g')"
+
+  msg_info "running deploy: $SSH_REMOTE [$opts], cmd file: $cmd_file"
+  local rv=0
+  # shellcheck disable=SC2086
+  if [ "$DO_IT" = "1" ]; then
+    ssh ${opts} "${SSH_REMOTE}" 'bash -s' < "$cmd_file"
+    local rv=$?
+  else
+    msg_warn "dry-run mode, add -y/--do-it cli args to actually run the commands remotely"
+  fi
+
+  msg_info "remote exit status: $rv"
+  return $rv
+}
+
+do_run() {
+  # only show a remote deploy script?
+  if [ "${SHOW_DEPLOY_SCRIPT}" = "1" ]; then
+    remote_script_write_out "$@"
+    return 0
+  fi
+
+  validate_env_vars
+
+  # check user-supplied-cmd files
+  remote_script_check_user_cmd_files "$@"
+
+  # fetch remote SSH key
+  ssh_fetch_host_key
+
+  # maybe install SSH private key
+  ssh_maybe_install_keys
+
+  # execute deploy
+  ssh_run_deploy "$@"
+}
+
+printhelp() {
+  cat <<EOF
+Usage: $MYNAME [opts] [file1] [file2] ...
+
+This script executes creates bash build file from a provided list of files in an attempt
+to execute some sort of deployment over SSH connection.
+
+ENVIRONMENT VARIABLES:
+
+* AUTH_SSH_KEY_PRIVATE        if defined, it's contents will be base64 decoded and used as a
+                              SSH private key used for authentication.
+* SSH_OPTS                    SSH additional command line options
+
+OPTIONS:
+  -r  --remote=USER@HOST      SSH remote uri            [\$SSH_REMOTE,      "$SSH_REMOTE"]
+  -p  --remote-port=PORT      SSH remote port           [\$SSH_PORT,        "$SSH_PORT"]
+  -w  --remote-dir=DIR        remote working directory  [\$SSH_REMOTE_DIR,  "$SSH_REMOTE_DIR"]
+
+  -I  --include-functions     include common functions to remote exec script?
+  -S  --show-deploy-script    show remote exec script to be ran via SSH on remote and exit
+
+  -y  --do-it                 really perform the remote deploy?
+
+      --no-cleanup            don't remove temporary files on exit
+  -v  --verbose               output debug messages
+  -q  --quiet                 quiet execution
+  -D  --debug                 enable bash-debug output
+  -h  --help                  This help message
+EOF
+  exit 0
+}
+
+######################################################################
+#                              MAIN                                  #
+######################################################################
+
+script_init
+
+# parse command line...
+TEMP=$(getopt -o r:p:w:ISyvqDh \
+              --long remote:,remote-port:,remote-dir:,include-functions,do-it,no-cleanup,verbose,quiet,debug,help \
+              -n "$MYNAME" -- "$@")
+test "$?" != "0" && die "Command line parsing error."
+eval set -- "$TEMP"
+while true; do
+  case $1 in
+    -r|--remote)
+      SSH_REMOTE="$2"
+      shift 2
+      ;;
+    -p|--remote-port)
+      SSH_PORT="$2"
+      shift 2
+      ;;
+    -w|--remote-dir)
+      SSH_REMOTE_DIR="$2"
+      shift 2
+      ;;
+    -I|--include-functions)
+      INCLUDE_COMMON_FUNCTIONS=1
+      shift
+      ;;
+    -y|--do-it)
+      DO_IT=1
+      shift
+      ;;
+    -S|--show-deploy-script)
+      SHOW_DEPLOY_SCRIPT=1
+      shift
+      ;;
+    --no-cleanup)
+      DO_CLEANUP=0
+      shift
+      ;;
+    -v|--verbose)
+      _VERBOSE=1
+      shift
+      ;;
+    -q|--quiet)
+      _DEBUG=0
+      _VERBOSE=0
+      _INFO=0
+      shift
+      ;;
+    -D|--debug)
+      _DEBUG=1
+      shift
+      ;;
+    -h|--help)
+      printhelp
+      exit 0
+      ;;
+    --)
+      shift
+      break
+      ;;
+    *)
+      die "Command line parsing error: '$1'."
+      ;;
+  esac
+done
+
+do_run "$@"
+my_exit "$?"
+
+# vim:shiftwidth=2 softtabstop=2 expandtab
+# EOF

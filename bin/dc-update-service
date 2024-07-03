@@ -1,0 +1,481 @@
+#!/usr/bin/env bash
+
+######################################################################
+#                            GLOBALS                                 #
+######################################################################
+
+RESTART_RELATED_SERVICES=${RESTART_RELATED_SERVICES:-""}
+COMPOSE_FILE=${COMPOSE_FILE:-"docker-compose.yml"}
+ENV_FILE=${ENV_FILE:-".env"}
+RESTART_SERVICES=${RESTART_SERVICES:-""}
+GIT_COMMIT=${GIT_COMMIT:-"0"}
+DO_IT=${DO_IT:-"0"}
+
+######################################################################
+#                            FUNCTIONS                               #
+######################################################################
+
+MYNAME=$(basename "$0")
+DO_CLEANUP=${DO_CLEANUP:-"1"}
+_INFO=${_INFO:-"1"}
+_DEBUG=${_DEBUG:-"0"}
+_VERBOSE=${_VERBOSE:-"0"}
+_CLEANUP_ITEMS=()
+_LOG_MSG_PREFIX=${_LOG_MSG_PREFIX:-""}
+_AFFECTED_SERVICES=""
+
+# processing vars
+SERVICE_NAME=""
+VAR_NAME=""
+IMAGE_VERSION=""
+RESULT_FILE=""
+
+# timestamp that everything started
+_TS_STARTED=$(date +%s)
+
+cleanup_perform() {
+  local item=""
+  if [ "$DO_CLEANUP" != "1" ]; then
+    [ ! -z "$_CLEANUP_ITEMS" ] && msg_warn "preserving execution evidence in:"
+    for item in "${_CLEANUP_ITEMS[@]}"; do
+      echo "  $item" 1>&2
+    done
+    return 0
+  fi
+
+  # do the real cleanup
+  for item in "${_CLEANUP_ITEMS[@]}"; do
+    msg_debug "removing cleanup item: $item"
+    rm -rf "$item" >/dev/null 2>&1 || true
+  done
+
+  return 0
+}
+
+cleanup_add() {
+  local item=""
+  for item in "$@"; do
+    # item must be a present filesystem entry, file or dir
+    test -r "$item" || continue
+
+    # add to a cleanup list
+    _CLEANUP_ITEMS+=("$item")
+  done
+
+  return 0
+}
+
+exec_duration() {
+  local now=$(date +%s)
+  echo $(( ${now} - ${_TS_STARTED} ))
+}
+
+my_exit() {
+  local exit_code=$1
+  cleanup_perform
+
+  msg_info "done after $(exec_duration) second(s)"
+  exit $exit_code
+}
+
+die() {
+  echo "${_LOG_MSG_PREFIX}FATAL: $*" 1>&2
+  my_exit 1
+}
+
+log_datetime() {
+  date +"${_LOG_MSG_PREFIX}[%Y/%m/%d %H:%M:%S] "
+  return 0
+}
+
+msg_info() {
+  test "${_INFO}" = "1" || return 0
+  echo "$(log_datetime)INFO:  $*"
+  return 0
+}
+
+msg_warn() {
+  echo "$(log_datetime)WARN:  $*" 1>&2
+  return 0
+}
+
+msg_verbose() {
+  test "${_VERBOSE}" = "1" || return 0
+  echo "$(log_datetime)VERBOSE: $*" 1>&2
+  return 0
+}
+
+msg_debug() {
+  test "${_DEBUG}" = "1" || return 0
+  echo "$(log_datetime)DEBUG: $*" 1>&2
+  return 0
+}
+
+require_utils() {
+  local util=""
+  for util in "$@"; do
+    local bin=$(which "$util" 2>/dev/null)
+    test -z "$bin" -o ! -x "$bin" && die "utility is not installed: $util"
+  done
+
+  return 0
+}
+
+require_gnu_utils() {
+  local util=""
+  for util in "$@"; do
+    local bin=$(which "$util" 2>/dev/null)
+    test -z "$bin" -o ! -x "$bin" && die "GNU version of utility is not installed: $util"
+    "$bin" --version | grep -Eq "\(GNU |util-linux" || die "Not a GNU version of utility: $util"
+  done
+
+  return 0
+}
+
+script_init() {
+  require_utils sed awk diff
+  require_gnu_utils grep
+
+  # make sure that docker compose is installed
+  docker compose version 2>/dev/null | grep -q version || die "docker compose is not installed"
+
+  return 0
+}
+
+rc_file_load() {
+  # source file
+  local rc_file=".dc-update-service.rc"
+  test -f "$rc_file" && {
+    # shellcheck disable=SC1090
+    . "$rc_file" || die "Unable to source file: $rc_file"
+  }
+
+  return 0
+}
+
+_do_parse_item_str() {
+  echo "$1" | cut -d/ -f"$2" | sed -e 's!^\ *!!g'
+}
+
+bad_item() {
+  local item="$1"
+  local err="$2"
+  local num=$3
+  die "bad item #$num [$item]: $err"
+}
+
+parse_service_item() {
+  local item="$1"
+  local num=$2
+
+  item=$(echo "$item" | sed -e 's!^\s*!!g')
+  test -z "${item}" && bad_item "$item" "empty item" $num
+
+  local service_name=$(_do_parse_item_str "${item}" 1)
+  local var_name=$(_do_parse_item_str "${item}" 2)
+  local image_version=$(_do_parse_item_str "${item}" 3)
+
+  test -z "$service_name" && bad_item "$item" "empty service name" $num
+  test -z "$var_name" && die bad_item "$item" "empty var name" $num
+  test -z "$image_version" && bad_item "$item" "empty image version" $num
+
+  # check that variable exists in the env file
+  grep -qP "^${var_name}=.+" "${ENV_FILE}" || bad_item "$item" "variable not found in $ENV_FILE: $var_name" $num
+
+  # check that this variable is being used as a part of an image name
+  grep -P '^\s*image: ' "${COMPOSE_FILE}" | grep -qPi ':\$\{'${var_name}'\}["'"'"']?\s*' || \
+    bad_item "$item" "couldn't find a service that would contain image using variable: ${var_name}" $num
+
+  # everything seems okay, set the stuff
+  SERVICE_NAME="${service_name}"
+  VAR_NAME="${var_name}"
+  IMAGE_VERSION="${image_version}"
+
+  return 0
+}
+
+process_service() {
+  local item="$1"
+  local num=$2
+
+  # parse it, will set $SERVICE_NAME, $VAR_NAME and $IMAGE_VERSION vars
+  parse_service_item "$item" "$num" || die "can't parse service item"
+  test -z "${SERVICE_NAME}" -o -z "${VAR_NAME}" -o -z "${IMAGE_VERSION}" && \
+    die "[$item] service vars were not set after parsing"
+
+  # we'll write into a tmp file
+  local tmp_file=$(mktemp 2>/dev/null)
+  test -z "$tmp_file" && die "[$item] can't create temporary result file"
+  cleanup_add "$tmp_file"
+
+  # time to do a search and replace
+  cat "${RESULT_FILE}" | \
+    sed -e "s!^${VAR_NAME}=.*!${VAR_NAME}=${IMAGE_VERSION}!g" > "${tmp_file}" || die "[$item]: can't replace image version"
+
+  # mark it as a affected service
+  _AFFECTED_SERVICES="${_AFFECTED_SERVICES} ${SERVICE_NAME}"
+
+  # looks like we were successful, let's pronounce created tmp file as a result file
+  RESULT_FILE="${tmp_file}"
+
+  return 0
+}
+
+foreach_item() {
+  local func_name="$1"
+  shift
+
+  test -z "$*" && die "no service items in a form of [service_name/image_version_variable_name/version] were given"
+
+  local num=0
+  local item=""
+  for item in "$@"; do
+    num=$((num + 1))
+    ${func_name} "$item" $num || die "error processing item #${num} [$item]: return value: $?"
+  done
+
+  return 0
+}
+
+do_it() {
+  test "$DO_IT" = "1"
+}
+
+is_dry_run() {
+  do_it || echo " [DRY RUN]"
+}
+
+git_commit() {
+  git status >/dev/null 2>&1 || {
+    msg_info "skipping git commit, not a git repository: $(pwd)"
+    return 0
+  }
+
+  msg_info "committing change to git$(is_dry_run)"
+  if do_it; then
+    local git_author="CI job runner"
+    local git_email="ci@example.org"
+
+    # be gitlab friendly
+    test ! -z "$GITLAB_USER_EMAIL" && git_email="$GITLAB_USER_EMAIL"
+    test ! -z "$GITLAB_USER_NAME" && git_author="[CI job ${CI_JOB_NAME}] $GITLAB_USER_NAME"
+
+    # Q: what is the difference between commit author and committer?
+    # A: The author is the person who originally wrote the work, whereas the committer is the person who last applied the work.
+    GIT_AUTHOR_NAME="${git_author}" \
+    GIT_AUTHOR_EMAIL="${git_email}" \
+    GIT_COMMITTER_NAME="${git_author}" \
+    GIT_COMMITTER_EMAIL="${git_email}" \
+      git commit \
+        -m "update by $MYNAME: $*" . || {
+          msg_warn "git commit failed (exit status: $?), ignoring"
+          return 0
+        }
+  fi
+
+  return 0
+}
+
+do_run() {
+  rc_file_load
+
+  test -z "$COMPOSE_FILE" && die "undefined docker compose file"
+  test -f "$COMPOSE_FILE" -a -r "$COMPOSE_FILE" || die "non-readable docker compose file: $COMPOSE_FILE"
+
+  test -z "$ENV_FILE" && die "undefined docker compose env_file"
+  test -f "$ENV_FILE" -a -w "$ENV_FILE" || die "non-writeable docker compose env_file: $ENV_FILE"
+  test -s "$ENV_FILE" || die "empty docker compose env_file: $ENV_FILE"
+
+  # make sure that compose is okay
+  local dcps=$(docker compose ps 2>&1)
+  local rv=$?
+  test "$rv" != "0" && die "docker compose ps exited with status: $rv\n$dcps"
+
+  # make sure that all service items make sense
+  foreach_item parse_service_item "$@"
+
+  msg_info "will manipulate compose env_file: $ENV_FILE"
+
+  # create tmp result file
+  local RESULT_FILE=$(mktemp 2>/dev/null)
+  test -z "$RESULT_FILE" && die "can't create temporary result file"
+  cleanup_add "$RESULT_FILE"
+  cp "$ENV_FILE" "$RESULT_FILE" || die "can't copy $ENV_FILE => $RESULT_FILE"
+
+  # time to process items
+  foreach_item process_service "$@"
+
+  # check the result file
+  test -z "$RESULT_FILE" -o ! -f "$RESULT_FILE" -o ! -s "$RESULT_FILE" && \
+    die "bad result file after processing items: '$RESULT_FILE'"
+
+  msg_info "items processed, final result file: $RESULT_FILE"
+  local diff_str=$(diff -u --color=always "$ENV_FILE" "$RESULT_FILE")
+  test -z "$diff_str" && {
+    msg_warn "no changes would be done to $ENV_FILE, exiting"
+    return 0
+  }
+
+  msg_info "env_file diff"
+  echo -e "$diff_str"
+
+  # replace env_file
+  msg_info "updating env_file ${ENV_FILE}$(is_dry_run)"
+  if do_it; then
+    cat "$RESULT_FILE" > "${ENV_FILE}" || die "error updating env from $ENV_FILE from $RESULT_FILE"
+  fi
+
+  # update compose services
+  test -z "${_AFFECTED_SERVICES}" && {
+    msg_info "no compose services were affected."
+    return 0
+  }
+
+  msg_info "updating compose services$(is_dry_run):${_AFFECTED_SERVICES}"
+  local dc_up_opts="--dry-run"
+  do_it && dc_up_opts=""
+  docker compose up -d --quiet-pull --remove-orphans ${dc_up_opts} ${_AFFECTED_SERVICES} || \
+    die "error while updating compose services"
+
+  # restart other compose services
+  if [ ! -z "${RESTART_RELATED_SERVICES}" ]; then
+    msg_info "restarting related compose services$(is_dry_run): $RESTART_RELATED_SERVICES"
+    if do_it; then
+      # shellcheck disable=SC2086
+      docker compose restart ${RESTART_RELATED_SERVICES} || \
+        die "error restarting related compose services: ${RESTART_RELATED_SERVICES}"
+    fi
+  fi
+
+  # optionally commit to git
+  git_commit "$@"
+
+  # final words...
+  msg_info "$MYNAME update done: $*"
+}
+
+printhelp() {
+  cat <<EOF
+Usage: $0 <svc_item1> [svc_item2]...
+
+This script updates docker image tag versions and restarts services if needed. It does so by updating
+env variables defined in compose env_file. Multiple services can be updated at the same time, see
+service items section.
+
+**NOTE/WARNING**: this script expects that it's being started from docker compose project directory
+
+SERVICE ITEMS
+Service items define what to update, their syntax is:
+
+    <service-name>/<image-tag-variable-name>/<image-tag>
+
+This means:
+  * restart compose service <service-name> upon successful env_file update
+  * look for <image-tag-variable-name> variable in env_file
+  * set <image-tag-variable-name> variable value to <image-tag> in env_file
+
+ENVIRONMENT VARIABLES
+
+This script honours multiple environment variables, all of them are mentioned in OPTIONS section.
+
+
+OPTIONS
+  -e  --env-file=FILE         compose env_file    [\$ENV_FILE        "$ENV_FILE"]
+  -c  --compose-file=FILE     compose file        [\$COMPOSE_FILE    "$COMPOSE_FILE]
+
+  -r  --restart-services=LIST restart given list of space separated services
+                              after successful update
+                                                  [\$RESTART_RELATED_SERVICES "$RESTART_RELATED_SERVICES"]
+
+  -g  --git                   commit changes to git?
+                                                  [\$GIT_COMMIT       "$GIT_COMMIT"]
+  -y  --do-it                 really perform the remote deploy?
+
+      --no-cleanup            don't remove temporary files on exit
+  -v  --verbose               output debug messages
+  -q  --quiet                 quiet execution
+  -D  --debug                 enable bash-debug output
+  -h  --help                  this help message
+
+EXAMPLES
+  # update cool-service v1.0.1 and bad-service to v3.4
+  $0 cool-service/COOL_SVC_IMG_TAG/v1.0.1 bad-service/BAD_SVC_IMG_TAG/v3.4 -y
+EOF
+}
+
+######################################################################
+#                              MAIN                                  #
+######################################################################
+
+set -o pipefail
+set -e
+
+script_init
+
+# parse command line...
+TEMP=$(getopt -o e:c:r:gyvqDh \
+              --long env-file:,compose-file:,restart-services:,git,do-it,no-cleanup,verbose,quiet,debug,help \
+              -n "$MYNAME" -- "$@")
+test "$?" != "0" && die "command line parsing error."
+eval set -- "$TEMP"
+while true; do
+  case $1 in
+    -e|--env-file)
+      ENV_FILE="$2"
+      shift 2
+      ;;
+    -c|--compose-file)
+      COMPOSE_FILE="$2"
+      shift 2
+      ;;
+    -r|--restart-services)
+      RESTART_RELATED_SERVICES="$2"
+      shift 2
+      ;;
+    -g|--git)
+      GIT_COMMIT=1
+      shift
+      ;;
+    -y|--do-it)
+      DO_IT=1
+      shift
+      ;;
+    --no-cleanup)
+      DO_CLEANUP=0
+      shift
+      ;;
+    -v|--verbose)
+      _VERBOSE=1
+      _DEBUG=1
+      shift
+      ;;
+    -q|--quiet)
+      _DEBUG=0
+      _VERBOSE=0
+      _INFO=0
+      shift
+      ;;
+    -D|--debug)
+      _DEBUG=1
+      set -x
+      shift
+      ;;
+    -h|--help)
+      printhelp
+      exit 0
+      ;;
+    --)
+      shift
+      break
+      ;;
+    *)
+      die "command line parsing error: '$1'."
+      ;;
+  esac
+done
+
+do_run "$@"
+my_exit "$?"
+
+# vim:shiftwidth=2 softtabstop=2 expandtab
+# EOF
