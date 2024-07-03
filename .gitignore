@@ -1,0 +1,29 @@
+# .gitignore
+
+# temp & swap files
+*~
+.*~
+
+*.bak
+.*.bak
+
+*.swp
+.*.swp
+
+# generic stuff
+tmp/
+git-info.json
+git-info.sh
+
+# Intellij IDEA
+.idea/
+
+# project build/test files
+.build/
+.*cache
+
+# docker-compose stuff
+.env
+
+# vim:shiftwidth=2 softtabstop=2 expandtab
+# EOF
